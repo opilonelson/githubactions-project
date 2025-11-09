@@ -1,18 +1,109 @@
-name: GitHub Actions Demo
-run-name: ${{ github.actor }} is testing out GitHub Actions 🚀
-on: [push]
+#name: GitHub Actions Demo
+#run-name: ${{ github.actor }} is testing out GitHub Actions 🚀
+#on: [push]
+#jobs:
+#  Explore-GitHub-Actions:
+#    runs-on: ubuntu-latest
+#    steps:
+#      - run: echo "🎉 The job was automatically triggered by a ${{ github.event_name }} event."
+#      - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by GitHub!"
+#      - run: echo "🔎 The name of your branch is ${{ github.ref }} and your repository is ${{ github.repository }}."
+#      - name: Check out repository code
+#        uses: actions/checkout@v5
+#      - run: echo "💡 The ${{ github.repository }} repository has been cloned to the runner."
+#      - run: echo "🖥️ The workflow is now ready to test your code on the runner."
+#      - name: List files in the repository
+#        run: |
+#          ls ${{ github.workspace }}
+#      - run: echo "🍏 This job's status is ${{ job.status }}."
+
+name: OWASP ZAP Baseline Scan
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
 jobs:
-  Explore-GitHub-Actions:
+  zap-scan:
     runs-on: ubuntu-latest
+    env:
+      APP_IMAGE: vulnerable-app:ci
+      APP_CONTAINER: vulnerable-app-ci
+      DOCKER_NET: zap-net
+      ZAP_REPORT: zap_report.html
+      TARGET_URL: http://app:8080
+
     steps:
-      - run: echo "🎉 The job was automatically triggered by a ${{ github.event_name }} event."
-      - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by GitHub!"
-      - run: echo "🔎 The name of your branch is ${{ github.ref }} and your repository is ${{ github.repository }}."
-      - name: Check out repository code
-        uses: actions/checkout@v5
-      - run: echo "💡 The ${{ github.repository }} repository has been cloned to the runner."
-      - run: echo "🖥️ The workflow is now ready to test your code on the runner."
-      - name: List files in the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 8
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew || true
+
+      - name: Build application (Gradle)
+        run: ./gradlew bootJar -x test
+
+      - name: Build Docker image
+        run: docker build -t $APP_IMAGE .
+
+      - name: Create Docker network
+        run: docker network create $DOCKER_NET || true
+
+      - name: Run app container on network
         run: |
-          ls ${{ github.workspace }}
-      - run: echo "🍏 This job's status is ${{ job.status }}."
+          docker rm -f $APP_CONTAINER || true
+          docker run -d --name $APP_CONTAINER --network $DOCKER_NET -e "SPRING_PROFILES_ACTIVE=default" $APP_IMAGE
+
+      - name: Wait for app to be ready
+        # Wait up to 60s for the app to respond on port 8080 inside network
+        run: |
+          for i in $(seq 1 30); do
+            if docker run --rm --network $DOCKER_NET byrnedo/alpine-curl:latest -sSf --connect-timeout 2 $TARGET_URL/actuator/health >/dev/null 2>&1; then
+              echo "App is up"
+              exit 0
+            fi
+            echo "Waiting for app... ($i)"
+            sleep 2
+          done
+          echo "App did not become ready in time"
+          docker logs $APP_CONTAINER || true
+          exit 1
+
+      - name: Run OWASP ZAP baseline scan
+        # We mount the workspace to /zap/wrk so the report is written to the workspace and becomes accessible
+        run: |
+          docker run --rm --network $DOCKER_NET -v "${{ github.workspace }}:/zap/wrk":rw owasp/zap2docker-stable \
+            zap-baseline.py -t "$TARGET_URL" -r "/zap/wrk/$ZAP_REPORT" || true
+        # Note: zap-baseline.py returns non-zero on some serious findings; we `|| true` so the job continues to upload the report.
+      
+      - name: Show brief zap report output (first 200 lines)
+        if: always()
+        run: head -n 200 $ZAP_REPORT || true
+
+      - name: Upload ZAP HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: $ZAP_REPORT
+
+      - name: Upload ZAP full logs (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-workdir
+          path: .zap  # if you use custom workdir or mounted directory for more outputs
+
+      - name: Cleanup containers and network
+        if: always()
+        run: |
+          docker rm -f $APP_CONTAINER || true
+          docker network rm $DOCKER_NET || true
+
